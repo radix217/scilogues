@@ -4,9 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Live Ontology Graph</title>
-    <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
-    <script src="https://unpkg.com/elkjs/lib/elk.bundled.js"></script>
-    <script src="https://unpkg.com/cytoscape-elk@2.2.0/cytoscape-elk.js"></script>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23a0b3ff'/%3E%3C/svg%3E">
+    <script src="https://unpkg.com/force-graph@1.45.0/dist/force-graph.min.js"></script>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -15,157 +14,288 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
     <script type="text/javascript">
         document.addEventListener('DOMContentLoaded', function () {
-            if (window.cytoscapeElk) {
-                cytoscape.use(window.cytoscapeElk);
-            }
-
             const container = document.getElementById('tree-container');
-            const cy = cytoscape({
-                container,
-                elements: [],
-                style: [
-                    { selector: 'node', style: { 'label': 'data(label)', 'background-opacity': 0, 'border-width': 0, 'color': 'data(color)', 'text-valign': 'center', 'text-halign': 'center', 'font-size': '12px', 'text-outline-width': 2, 'text-outline-color': '#1f242d' } },
-                    { selector: 'edge', style: { 'curve-style': 'bezier', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#7f8fa6', 'line-color': '#7f8fa6', 'width': 1.5 } },
-                    { selector: 'node.highlight', style: { 'color': '#00e5ff', 'text-outline-color': '#101318', 'text-outline-width': 3 } }
-                ],
-                wheelSensitivity: 0.2,
-            });
-
             const socket = io();
-
-            function colorForDepth(depth) {
-                const d = typeof depth === 'number' ? depth : 0;
-                const minHue = 120;
-                const maxHue = 270;
-                const span = maxHue - minHue;
-                const period = 8;
-                const t = (d % period) / (period - 1);
-                const hue = Math.round(minHue + span * t);
-                return `hsl(${hue}, 65%, 45%)`;
+            const palette = ['#D3F6DB', '#AAA1C8', '#AF3B6E', '#42CAFD'];
+            function hexToRgb(h) { const s = h.replace('#', ''); return { r: parseInt(s.substring(0, 2), 16), g: parseInt(s.substring(2, 4), 16), b: parseInt(s.substring(4, 6), 16) }; }
+            function toHex(v) { const s = v.toString(16); return s.length === 1 ? '0' + s : s; }
+            function rgbToHex(r, g, b) { return `#${toHex(r)}${toHex(g)}${toHex(b)}`; }
+            function colorFromWeights(weights) {
+                let maxI = 0; let maxW = -1;
+                for (let i = 0; i < weights.length; i++) {
+                    if (weights[i] > maxW) { maxW = weights[i]; maxI = i; }
+                }
+                return palette[maxI];
             }
-
-            // Run ELK layout
-            function runLayout(animated = true) {
-                const layout = cy.layout({
-                    name: 'elk',
-                    nodeDimensionsIncludeLabels: true,
-                    animate: animated,
-                    animationDuration: 600,
-                    animationEasing: 'ease-in-out',
-                    fit: true,
-                    padding: 30,
-                    elk: {
-                        algorithm: 'layered',
-                        'elk.direction': 'DOWN',
-                        'elk.layered.spacing.nodeNodeBetweenLayers': 80,
-                        'elk.spacing.nodeNode': 40,
-                        'elk.spacing.edgeNode': 20,
-                        'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
-                        'elk.edgeRouting': 'POLYLINE',
-                        'elk.layered.crossingMinimization.semiInteractive': true,
-                        'elk.initialPositions': false
+            function evolve(color, seed) {
+                const src = hexToRgb(color || '#a0b3ff');
+                const idx = (seed >>> 0) % 4;
+                const dst = hexToRgb(palette[idx]);
+                const t = 0.12 + 0.10 * rand01(seed ^ 0x85ebca6b);
+                const r = Math.round(src.r * (1 - t) + dst.r * t);
+                const g = Math.round(src.g * (1 - t) + dst.g * t);
+                const b = Math.round(src.b * (1 - t) + dst.b * t);
+                return rgbToHex(r, g, b);
+            }
+            function normalize(ws) { const sum = ws.reduce((a,b)=>a+b,0) || 1; for (let i=0;i<ws.length;i++) { ws[i] = Math.max(0, ws[i]); } const s2 = ws.reduce((a,b)=>a+b,0) || 1; return ws.map(v=>v/s2); }
+            function hashStr(s) { let h = 2166136261; for (let i=0;i<s.length;i++) { h ^= s.charCodeAt(i); h += (h<<1) + (h<<4) + (h<<7) + (h<<8) + (h<<24); } return h >>> 0; }
+            function rand01(seed) { const x = (seed * 1664525 + 1013904223) >>> 0; return x / 0xffffffff; }
+            function mutateWeights(parentW, seed) {
+                const ws = parentW.slice();
+                const idx = (seed >>> 0) % 4;
+                const r = rand01(seed ^ 0x9e3779b9);
+                const alpha = 0.35 + 0.35 * r;
+                for (let i = 0; i < 4; i++) ws[i] *= (1 - alpha * 0.6);
+                ws[idx] += alpha;
+                const n1 = rand01(seed ^ 0x85ebca6b) - 0.5;
+                const n2 = rand01(seed ^ 0xc2b2ae35) - 0.5;
+                const n3 = rand01(seed ^ 0x27d4eb2f) - 0.5;
+                const n4 = rand01(seed ^ 0x165667b1) - 0.5;
+                const noise = [n1, n2, n3, n4];
+                for (let i = 0; i < 4; i++) {
+                    if (i === idx) continue;
+                    ws[i] += 0.05 * alpha + 0.1 * alpha * noise[i];
+                }
+                return normalize(ws);
+            }
+            function seedWeightsFromId(id) { const h = hashStr(id); const w0 = (h & 0xff) / 255; const w1 = ((h >>> 8) & 0xff) / 255; const w2 = ((h >>> 16) & 0xff) / 255; const w3 = ((h >>> 24) & 0xff) / 255; return normalize([w0, w1, w2, w3]); }
+            function alphaColor(hex, a) { const c = hexToRgb(hex); return `rgba(${c.r},${c.g},${c.b},${Math.max(0, Math.min(1, a))})`; }
+            const weightsById = new Map();
+            const pendingByParent = new Map();
+            function setWeightsAndColor(id, weights) { weightsById.set(id, weights); const color = colorFromWeights(weights); const node = data.nodes.find(x=>x.id===id); if (node) node.color = color; if (typeof graph?.refresh === 'function') graph.refresh(); }
+            function ensureColorForNode(n) {
+                const id = n.id;
+                const p = n.parentid;
+                const node = data.nodes.find(x => x.id === id) || n;
+                if (!p) {
+                    if (!node.color) node.color = palette[hashStr(id) % 4];
+                    const pend = pendingByParent.get(id) || [];
+                    for (const cId of pend) {
+                        const cNode = data.nodes.find(x => x.id === cId);
+                        if (cNode) ensureColorForNode(cNode);
                     }
-                });
-                layout.run();
+                    pendingByParent.delete(id);
+                    return;
+                }
+                const parent = data.nodes.find(x => x.id === p);
+                if (parent && parent.color) {
+                    const seed = (hashStr(id) ^ hashStr(p)) >>> 0;
+                    const evolved = evolve(parent.color, seed);
+                    node.color = evolved;
+                    node._evolvedFrom = p;
+                    const pend = pendingByParent.get(id) || [];
+                    for (const cId of pend) {
+                        const cNode = data.nodes.find(x => x.id === cId);
+                        if (cNode) ensureColorForNode(cNode);
+                    }
+                    pendingByParent.delete(id);
+                    return;
+                }
+                const arr = pendingByParent.get(p) || [];
+                if (!arr.includes(id)) arr.push(id);
+                pendingByParent.set(p, arr);
+                if (!node.color) node.color = palette[hashStr(id) % 4];
             }
-
-            // Buffer nodes and edges for batch layout
-            let nodesBuffer = [];
-            let edgesBuffer = [];
-            let layoutScheduled = false;
-
-            function scheduleBufferedLayout() {
-                if (layoutScheduled) return;
-                layoutScheduled = true;
-                setTimeout(() => {
-                    cy.batch(() => {
-                        if (nodesBuffer.length > 0) cy.add(nodesBuffer);
-                        if (edgesBuffer.length > 0) cy.add(edgesBuffer);
-                    });
-                    nodesBuffer = [];
-                    edgesBuffer = [];
-                    if (cy.elements().length > 0) runLayout(false);
-                    layoutScheduled = false;
+            const data = { nodes: [], links: [] };
+            const graph = ForceGraph()(container)
+                .graphData(data)
+                .width(container.clientWidth)
+                .height(container.clientHeight)
+                .nodeId('id')
+                .nodeLabel(n => n.label)
+                .nodeColor(n => n.color)
+                .nodeRelSize(6)
+                .linkSource('source')
+                .linkTarget('target')
+                .linkColor(l => alphaColor('#7f8fa6', typeof l._fade === 'number' ? l._fade : 1))
+                .linkDirectionalArrowLength(3)
+                .cooldownTicks(300);
+            graph.nodeCanvasObject((node, ctx, globalScale) => {
+                const label = node.label || '';
+                const fontSize = Math.max(3, 8 / globalScale);
+                ctx.font = `bold ${fontSize}px Inter, Roboto, Arial, sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                const a = typeof node._fade === 'number' ? node._fade : 1;
+                const prevAlpha = ctx.globalAlpha;
+                ctx.globalAlpha = a;
+                ctx.fillStyle = node.color || '#a0b3ff';
+                ctx.fillText(label, node.x || 0, node.y || 0);
+                ctx.globalAlpha = prevAlpha;
+            }).nodeCanvasObjectMode(() => 'replace');
+            function upsertNode(n) {
+                const idx = data.nodes.findIndex(x => x.id === n.id);
+                const entry = { id: n.id, label: n.topic, parentid: n.parentid, depth: n.depth };
+                if (idx >= 0) data.nodes[idx] = { ...data.nodes[idx], ...entry };
+                else data.nodes.push(entry);
+                ensureColorForNode(entry);
+            }
+            function hasLink(s, t) {
+                return data.links.some(l => l.source === s && l.target === t || l.source?.id === s && l.target?.id === t);
+            }
+            function nodeExists(id) {
+                return data.nodes.some(n => n.id === id);
+            }
+            function addLinkImmediate(s, t) {
+                if (!hasLink(s, t)) data.links.push({ source: s, target: t });
+            }
+            let pendingLinks = [];
+            function addLinkSafe(s, t) {
+                if (nodeExists(s) && nodeExists(t)) {
+                    addLinkImmediate(s, t);
+                    return true;
+                } else {
+                    const existsPending = pendingLinks.some(e => e.source === s && e.target === t);
+                    if (!existsPending) pendingLinks.push({ source: s, target: t });
+                    return false;
+                }
+            }
+            function resolvePendingLinks() {
+                if (!pendingLinks.length) return [];
+                const remaining = [];
+                const addedList = [];
+                for (const e of pendingLinks) {
+                    if (nodeExists(e.source) && nodeExists(e.target)) {
+                        addLinkImmediate(e.source, e.target);
+                        addedList.push({ source: e.source, target: e.target });
+                    } else {
+                        remaining.push(e);
+                    }
+                }
+                pendingLinks = remaining;
+                return addedList;
+            }
+            let nodeBuf = [];
+            let linkBuf = [];
+            let flushTimer = null;
+            let firstFlush = true;
+            let focusLockId = null;
+            let fadingIds = new Set();
+            let fadingLinkKeys = new Set();
+            let animating = false;
+            let lastTick = 0;
+            function linkKey(s, t) { return `${s}|${t}`; }
+            function startFadeIn(id) {
+                const n = data.nodes.find(x => x.id === id);
+                if (!n) return;
+                n._fade = 0;
+                fadingIds.add(id);
+                if (!animating) {
+                    animating = true;
+                    lastTick = performance.now();
+                    requestAnimationFrame(stepFade);
+                }
+            }
+            function startFadeInLink(s, t) {
+                const key = linkKey(s, t);
+                const l = data.links.find(e => (e.source === s && e.target === t) || (e.source?.id === s && e.target?.id === t));
+                if (!l) return;
+                l._fade = 0;
+                fadingLinkKeys.add(key);
+                if (!animating) {
+                    animating = true;
+                    lastTick = performance.now();
+                    requestAnimationFrame(stepFade);
+                }
+            }
+            function stepFade(ts) {
+                const dt = Math.max(0, ts - lastTick);
+                lastTick = ts;
+                const speed = 1 / 250;
+                const ids = Array.from(fadingIds);
+                for (const id of ids) {
+                    const n = data.nodes.find(x => x.id === id);
+                    if (!n) { fadingIds.delete(id); continue; }
+                    const inc = dt * speed;
+                    n._fade = Math.min(1, (typeof n._fade === 'number' ? n._fade : 0) + inc);
+                    if (n._fade >= 1) fadingIds.delete(id);
+                }
+                const lks = Array.from(fadingLinkKeys);
+                for (const key of lks) {
+                    const [s, t] = key.split('|');
+                    const l = data.links.find(e => (e.source === s && e.target === t) || (e.source?.id === s && e.target?.id === t));
+                    if (!l) { fadingLinkKeys.delete(key); continue; }
+                    const inc = dt * speed;
+                    l._fade = Math.min(1, (typeof l._fade === 'number' ? l._fade : 0) + inc);
+                    if (l._fade >= 1) fadingLinkKeys.delete(key);
+                }
+                if (typeof graph?.refresh === 'function') graph.refresh();
+                if (fadingIds.size > 0 || fadingLinkKeys.size > 0) requestAnimationFrame(stepFade);
+                else animating = false;
+            }
+            function scheduleFlush() {
+                if (flushTimer) return;
+                flushTimer = setTimeout(() => {
+                    if (nodeBuf.length) {
+                        nodeBuf.forEach(upsertNode);
+                        nodeBuf = [];
+                    }
+                    if (linkBuf.length) {
+                        linkBuf.forEach(e => addLinkSafe(e.source, e.target));
+                        linkBuf = [];
+                    }
+                    const added = resolvePendingLinks();
+                    for (const n of data.nodes) { ensureColorForNode(n); }
+                    graph.graphData(data);
+                    if (typeof graph.d3ReheatSimulation === 'function') graph.d3ReheatSimulation();
+                    if (firstFlush && typeof graph.zoomToFit === 'function' && data.nodes.length > 0) {
+                        graph.zoomToFit(600, 40);
+                        firstFlush = false;
+                    }
+                    flushTimer = null;
                 }, 50);
             }
-
-            // Existing nodes and edges
-            socket.on('existing_nodes', (existingNodes) => {
-                const toAdd = existingNodes.map(n => ({ data: { id: n.id, label: n.topic, color: colorForDepth(n.depth) } }));
-                nodesBuffer.push(...toAdd);
-                scheduleBufferedLayout();
+            socket.on('existing_nodes', list => {
+                nodeBuf.push(...list);
+                scheduleFlush();
             });
-
-            socket.on('existing_edges', (existingEdges) => {
-                const toAdd = existingEdges.map(e => ({ data: { id: `${e.parentid}-${e.childid}`, source: e.parentid, target: e.childid } }));
-                edgesBuffer.push(...toAdd);
-                scheduleBufferedLayout();
+            socket.on('existing_edges', list => {
+                linkBuf.push(...list.map(e => ({ source: e.parentid, target: e.childid })));
+                scheduleFlush();
             });
-
-            // New nodes
-            socket.on('new_node', (node) => {
-                const el = cy.getElementById(node.id);
-                if (el && el.nonempty()) {
-                    el.data('label', node.topic);
-                    el.data('color', colorForDepth(node.depth));
+            socket.on('new_node', n => {
+                upsertNode(n);
+                if (n.parentid) addLinkSafe(n.parentid, n.id);
+                const addedLinks = resolvePendingLinks();
+                graph.graphData(data);
+                if (addedLinks && addedLinks.length) {
+                    for (const e of addedLinks) startFadeInLink(e.source, e.target);
+                }
+                const found = data.nodes.find(x => x.id === n.id);
+                if (!focusLockId && found && typeof found.x === 'number' && typeof found.y === 'number') {
+                    graph.centerAt(found.x, found.y, 600);
+                }
+                startFadeIn(n.id);
+            });
+            socket.on('new_edge', e => {
+                if (!e || !e.from || !e.to) return;
+                addLinkSafe(e.from, e.to);
+                const addedLinks = resolvePendingLinks();
+                graph.graphData(data);
+                if (addedLinks && addedLinks.length) {
+                    for (const ed of addedLinks) startFadeInLink(ed.source, ed.target);
                 } else {
-                    cy.batch(() => {
-                        cy.add({ data: { id: node.id, label: node.topic, color: colorForDepth(node.depth) } });
-                    });
-                }
-                if (node.parentid) {
-                    const eid = `${node.parentid}-${node.id}`;
-                    if (!cy.getElementById(eid).nonempty()) {
-                        cy.batch(() => {
-                            cy.add({ data: { id: eid, source: node.parentid, target: node.id } });
-                        });
-                    }
-                }
-                cy.$(`#${node.id}`).addClass('highlight');
-                setTimeout(() => cy.$(`#${node.id}`).removeClass('highlight'), 600);
-                scheduleLayout(true, 100);
-            });
-
-            // New edges
-            socket.on('new_edge', (edge) => {
-                if (edge && edge.from && edge.to) {
-                    const eid = `${edge.from}-${edge.to}`;
-                    if (!cy.getElementById(eid).nonempty()) {
-                        cy.batch(() => {
-                            cy.add({ data: { id: eid, source: edge.from, target: edge.to } });
-                        });
-                        scheduleLayout(true, 100);
-                    }
+                    startFadeInLink(e.from, e.to);
                 }
             });
-
-            // Update nodes
-            socket.on('update_node', (node) => {
-                const el = cy.getElementById(node.id);
-                if (el && el.nonempty()) {
-                    el.addClass('highlight');
-                    cy.animate({ center: { eles: el }, zoom: Math.min(2, Math.max(cy.zoom(), 1.2)) }, { duration: 500, easing: 'ease-in-out' });
-                    setTimeout(() => el.removeClass('highlight'), 600);
+            socket.on('update_node', n => {
+                const found = data.nodes.find(x => x.id === n.id);
+                focusLockId = n.id;
+                if (found && typeof found.x === 'number' && typeof found.y === 'number') {
+                    graph.centerAt(found.x, found.y, 500);
                 }
             });
-
-            // Schedule re-layout
-            let layoutTimer = null;
-            function scheduleLayout(animated = true, delay = 200) {
-                if (layoutTimer) clearTimeout(layoutTimer);
-                layoutTimer = setTimeout(() => runLayout(animated), delay);
+            socket.on('batch_ready', payload => {
+                if (payload && payload.parentid && payload.parentid === focusLockId) {
+                    focusLockId = null;
+                }
+            });
+            function resize() {
+                graph.width(container.clientWidth);
+                graph.height(container.clientHeight);
             }
-
-            window.addEventListener('resize', () => {
-                if (cy && cy.elements().length > 0) {
-                    cy.fit(undefined, 30);
-                }
-            });
-
-            // Optional periodic re-layout
-            setInterval(() => {
-                if (cy && cy.elements().length > 0) scheduleLayout(false, 0);
-            }, 5000);
+            window.addEventListener('resize', resize);
+            resize();
         });
     </script>
 </body>

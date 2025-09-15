@@ -13,12 +13,15 @@ def index():
 def tree_generator_thread():
     generate_tree_live(socketio, 'tree.csv', max_nodes=25000)
 
+_generator_started = threading.Event()
+
 @socketio.on('connect')
 def handle_connect():
     print('Client connected')
-    # Start the tree generation in a background thread
-    # to avoid blocking the main server process.
-    threading.Thread(target=tree_generator_thread).start()
+    if not _generator_started.is_set():
+        _generator_started.set()
+        t = threading.Thread(target=tree_generator_thread, daemon=True)
+        t.start()
 
 if __name__ == '__main__':
     socketio.run(app, debug=True)

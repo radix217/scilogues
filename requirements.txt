@@ -3,3 +3,4 @@ pydantic
 instructor
 Flask
 Flask-SocketIO
+python-dotenv

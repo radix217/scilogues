@@ -3,8 +3,10 @@ from dataclasses import dataclass
 from typing import List, Optional, Iterable, Dict, Any, Tuple
 import csv
 import os
-from generator import createroot, expand
+from generator import expand
 from flask_socketio import SocketIO
+
+ROOT_TOPIC = "Knowledge"
 
 
 @dataclass
@@ -12,8 +14,9 @@ class Node:
     id: str
     topic: str
     parentid: Optional[str]
-    expanded: bool = False
+    expanded: str = "false"
     depth: int = 0
+    importance: int = 0
 
 
 @dataclass
@@ -24,17 +27,19 @@ class Edge:
     order: int = 0
 
 
-def parse_bool(v: Any) -> bool:
+def normalize_expanded(v: Any) -> str:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in {"true", "false", "skipped"}:
+            return s
     if isinstance(v, bool):
-        return v
-    if v is None:
-        return False
+        return "true" if v else "false"
     s = str(v).strip().lower()
     if s in {"1", "true", "t", "yes", "y"}:
-        return True
+        return "true"
     if s in {"0", "false", "f", "no", "n", ""}:
-        return False
-    return False
+        return "false"
+    return "false"
 
 
 def read_nodes(csv_path: str) -> List[Node]:
@@ -49,15 +54,16 @@ def read_nodes(csv_path: str) -> List[Node]:
                     id=str(row.get("id", "")).strip(),
                     topic=str(row.get("topic", "")).strip(),
                     parentid=(p if (p := str(row.get("parentid", "")).strip()) != "" else None),
-                    expanded=parse_bool(row.get("expanded", "false")),
+                    expanded=normalize_expanded(row.get("expanded", "false")),
                     depth=int(str(row.get("depth", "0")).strip() or 0),
+                    importance=int(str(row.get("importance", "0")).strip() or 0),
                 )
             )
     return nodes
 
 
 def write_nodes(csv_path: str, nodes: List[Node]) -> None:
-    fieldnames = ["id", "topic", "parentid", "expanded", "depth"]
+    fieldnames = ["id", "topic", "parentid", "expanded", "depth", "importance"]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -67,8 +73,9 @@ def write_nodes(csv_path: str, nodes: List[Node]) -> None:
                     "id": n.id,
                     "topic": n.topic,
                     "parentid": "" if n.parentid is None else n.parentid,
-                    "expanded": "true" if n.expanded else "false",
+                    "expanded": normalize_expanded(getattr(n, "expanded", "false")),
                     "depth": int(getattr(n, "depth", 0) or 0),
+                    "importance": int(getattr(n, "importance", 0) or 0),
                 }
             )
 
@@ -134,7 +141,7 @@ def get_hierarchy(node: Node, nodes_by_id: Dict[str, Node]) -> List[str]:
 
 def first_unexpanded(nodes: List[Node]) -> Optional[Node]:
     for n in nodes:
-        if not n.expanded:
+        if normalize_expanded(n.expanded) == "false":
             return n
     return None
 
@@ -144,23 +151,42 @@ def normalize_node(obj: Any, parentid: Optional[str], parentdepth: int) -> Optio
         return None
     if isinstance(obj, Node):
         d = getattr(obj, "depth", parentdepth)
-        return Node(id=str(obj.id), topic=str(obj.topic), parentid=obj.parentid if obj.parentid is not None else parentid, expanded=parse_bool(obj.expanded), depth=int(d))
+        imp = int(getattr(obj, "importance", 0) or 0)
+        return Node(
+            id=str(obj.id),
+            topic=str(obj.topic),
+            parentid=obj.parentid if obj.parentid is not None else parentid,
+            expanded=normalize_expanded(getattr(obj, "expanded", "false")),
+            depth=int(d),
+            importance=imp,
+        )
     if isinstance(obj, dict):
         nid = str(obj.get("id", "")).strip()
         topic = str(obj.get("topic", "")).strip()
         pid = obj.get("parentid", parentid)
         pid = None if pid in (None, "", "None") else str(pid)
-        exp = parse_bool(obj.get("expanded", False))
+        exp = normalize_expanded(obj.get("expanded", "false"))
         dval = obj.get("depth", parentdepth + (0 if pid is None else 1))
         try:
             d = int(dval)
         except Exception:
             d = parentdepth + (0 if pid is None else 1)
-        return Node(id=nid, topic=topic, parentid=pid, expanded=exp, depth=int(d))
+        imp = obj.get("importance", 0)
+        try:
+            impi = int(imp)
+        except Exception:
+            impi = 0
+        return Node(id=nid, topic=topic, parentid=pid, expanded=exp, depth=int(d), importance=impi)
     if isinstance(obj, (tuple, list)) and len(obj) >= 2:
         nid = str(obj[0])
         topic = str(obj[1])
-        return Node(id=nid, topic=topic, parentid=parentid, expanded=False, depth=parentdepth + 1)
+        imp = 0
+        if len(obj) >= 3:
+            try:
+                imp = int(obj[2])
+            except Exception:
+                imp = 0
+        return Node(id=nid, topic=topic, parentid=parentid, expanded="false", depth=parentdepth + 1, importance=imp)
     return None
 
 
@@ -183,7 +209,7 @@ def add_children(nodes: List[Node], parent: Node, children: Iterable[Any]) -> in
             by_id[normalized.id] = normalized
             by_topic[key] = normalized
             added += 1
-    parent.expanded = True
+    parent.expanded = "true"
     return added
 
 
@@ -203,19 +229,12 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
         socketio.emit('existing_edges', [e.__dict__ for e in edges])
 
     if not nodes:
-        root = createroot()
-        rnode = normalize_node(root, parentid=None, parentdepth=0)
-        if rnode:
-            root_node = Node(id=rnode.id, topic=rnode.topic, parentid=None, expanded=False, depth=0)
-            nodes.append(root_node)
-            nodes_by_id[root_node.id] = root_node
-            topic_idx[root_node.topic.strip().lower()] = root_node
-            write_nodes(nodes_csv, nodes)
-            socketio.emit('new_node', root_node.__dict__)
-        else:
-            write_nodes(nodes_csv, nodes)
-            write_edges(edges_csv, edges)
-            return
+        root_node = Node(id="root", topic=ROOT_TOPIC, parentid=None, expanded="false", depth=0, importance=10)
+        nodes.append(root_node)
+        nodes_by_id[root_node.id] = root_node
+        topic_idx[root_node.topic.strip().lower()] = root_node
+        write_nodes(nodes_csv, nodes)
+        socketio.emit('new_node', root_node.__dict__)
 
     total_added = 0
     while total_added < max_nodes:
@@ -226,12 +245,16 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
         socketio.emit('update_node', current.__dict__)
         socketio.sleep(0.1)
 
-        try:
-            hierarchy = get_hierarchy(current, nodes_by_id)
-            children = expand(current.topic, hierarchy)
-        except Exception as e:
-            print(f"Failed to expand {current.topic}: {e}")
+        if int(getattr(current, "importance", 0) or 0) < 6:
+            current.expanded = "skipped"
             children = None
+        else:
+            try:
+                hierarchy = get_hierarchy(current, nodes_by_id)
+                children = expand(current.topic, hierarchy)
+            except Exception as e:
+                print(f"Failed to expand {current.topic}: {e}")
+                children = None
 
         new_nodes: List[Node] = []
         new_edges: List[Edge] = []
@@ -253,8 +276,9 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
                         id=normalized.id,
                         topic=normalized.topic,
                         parentid=current.id,
-                        expanded=False,
+                        expanded="false",
                         depth=current.depth + 1,
+                        importance=int(getattr(normalized, "importance", 0) or 0),
                     )
                     nodes.append(n)
                     nodes_by_id[n.id] = n
@@ -265,7 +289,7 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
                     edge_set.add((current.id, n.id))
                     new_edges.append(e)
 
-            current.expanded = True
+            current.expanded = "true"
             total_added += len(new_nodes)
 
             # Emit new nodes and edges
@@ -275,8 +299,13 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
             for e in new_edges:
                 socketio.emit('new_edge', {"from": e.parentid, "to": e.childid})
                 socketio.sleep(0.02)
+            socketio.emit('batch_ready', {"parentid": current.id, "children": [n.id for n in new_nodes]})
         else:
-            current.expanded = True
+            if normalize_expanded(current.expanded) == "skipped":
+                current.expanded = "skipped"
+            else:
+                current.expanded = "true"
+            socketio.emit('batch_ready', {"parentid": current.id, "children": []})
 
         write_nodes(nodes_csv, nodes)
         write_edges(edges_csv, edges)
@@ -287,26 +316,24 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
 def update_csv_tree(csv_path: str, max_nodes: int = 1000) -> List[Node]:
     nodes = read_nodes(csv_path)
     if not nodes:
-        root = createroot()
-        rnode = normalize_node(root, parentid=None, parentdepth=0)
-        if rnode:
-            nodes.append(Node(id=rnode.id, topic=rnode.topic, parentid=None, expanded=False, depth=0))
-            write_nodes(csv_path, nodes)
-        else:
-            write_nodes(csv_path, nodes)
-            return nodes
+        nodes.append(Node(id="root", topic=ROOT_TOPIC, parentid=None, expanded="false", depth=0, importance=10))
+        write_nodes(csv_path, nodes)
     total_added = 0
     nodes_by_id = index_by_id(nodes)
     while total_added < max_nodes:
         current = first_unexpanded(nodes)
         if current is None:
             break
-        try:
-            hierarchy = get_hierarchy(current, nodes_by_id)
-            children = expand(current.topic, hierarchy)
-        except Exception as e:
-            print(f"Failed to expand {current.topic}: {e}")
+        if int(getattr(current, "importance", 0) or 0) < 6:
+            current.expanded = "skipped"
             children = None
+        else:
+            try:
+                hierarchy = get_hierarchy(current, nodes_by_id)
+                children = expand(current.topic, hierarchy)
+            except Exception as e:
+                print(f"Failed to expand {current.topic}: {e}")
+                children = None
         before = len(nodes)
         if children:
             added_count = add_children(nodes, current, children)
@@ -314,8 +341,11 @@ def update_csv_tree(csv_path: str, max_nodes: int = 1000) -> List[Node]:
             if added_count > 0:
                 nodes_by_id = index_by_id(nodes)
         else:
-            current.expanded = True
-        if len(nodes) == before and current.expanded and first_unexpanded(nodes) is None:
+            if normalize_expanded(current.expanded) == "skipped":
+                current.expanded = "skipped"
+            else:
+                current.expanded = "true"
+        if len(nodes) == before and normalize_expanded(current.expanded) != "false" and first_unexpanded(nodes) is None:
             break
         write_nodes(csv_path, nodes)
     write_nodes(csv_path, nodes)
