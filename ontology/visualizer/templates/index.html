@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live Ontology Graph</title>
+    <title>Ontology Graph</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23a0b3ff'/%3E%3C/svg%3E">
     <script src="https://unpkg.com/force-graph@1.45.0/dist/force-graph.min.js"></script>
     <link rel="stylesheet" href="/static/style.css">
@@ -11,11 +11,9 @@
 <body>
     <div id="tree-container" style="width:100%; height:100vh;"></div>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
     <script type="text/javascript">
         document.addEventListener('DOMContentLoaded', function () {
             const container = document.getElementById('tree-container');
-            const socket = io();
             const palette = ['#D3F6DB', '#AAA1C8', '#AF3B6E', '#42CAFD'];
             function hexToRgb(h) { const s = h.replace('#', ''); return { r: parseInt(s.substring(0, 2), 16), g: parseInt(s.substring(2, 4), 16), b: parseInt(s.substring(4, 6), 16) }; }
             function toHex(v) { const s = v.toString(16); return s.length === 1 ? '0' + s : s; }
@@ -223,72 +221,28 @@
                 if (fadingIds.size > 0 || fadingLinkKeys.size > 0) requestAnimationFrame(stepFade);
                 else animating = false;
             }
-            function scheduleFlush() {
-                if (flushTimer) return;
-                flushTimer = setTimeout(() => {
-                    if (nodeBuf.length) {
-                        nodeBuf.forEach(upsertNode);
-                        nodeBuf = [];
-                    }
-                    if (linkBuf.length) {
-                        linkBuf.forEach(e => addLinkSafe(e.source, e.target));
-                        linkBuf = [];
-                    }
-                    const added = resolvePendingLinks();
-                    for (const n of data.nodes) { ensureColorForNode(n); }
-                    graph.graphData(data);
-                    if (typeof graph.d3ReheatSimulation === 'function') graph.d3ReheatSimulation();
-                    if (firstFlush && typeof graph.zoomToFit === 'function' && data.nodes.length > 0) {
-                        graph.zoomToFit(600, 40);
-                        firstFlush = false;
-                    }
-                    flushTimer = null;
-                }, 50);
+            function renderOnce(payload) {
+                if (!payload || !payload.nodes) return;
+                nodeBuf = payload.nodes.slice();
+                linkBuf = (payload.links || []).slice();
+                if (nodeBuf.length) nodeBuf.forEach(upsertNode);
+                if (linkBuf.length) linkBuf.forEach(e => addLinkSafe(e.source, e.target));
+                resolvePendingLinks();
+                for (const n of data.nodes) { ensureColorForNode(n); }
+                graph.graphData(data);
+                if (typeof graph.zoomToFit === 'function' && data.nodes.length > 0) {
+                    graph.zoomToFit(600, 40);
+                }
+                const roots = data.nodes.filter(n => !n.parentid);
+                if (roots.length > 0 && typeof graph.centerAt === 'function') {
+                    const r = roots[0];
+                    if (typeof r.x === 'number' && typeof r.y === 'number') graph.centerAt(r.x, r.y, 600);
+                }
+                data.nodes.forEach(n => startFadeIn(n.id));
+                data.links.forEach(l => startFadeInLink(l.source?.id || l.source, l.target?.id || l.target));
             }
-            socket.on('existing_nodes', list => {
-                nodeBuf.push(...list);
-                scheduleFlush();
-            });
-            socket.on('existing_edges', list => {
-                linkBuf.push(...list.map(e => ({ source: e.parentid, target: e.childid })));
-                scheduleFlush();
-            });
-            socket.on('new_node', n => {
-                upsertNode(n);
-                if (n.parentid) addLinkSafe(n.parentid, n.id);
-                const addedLinks = resolvePendingLinks();
-                graph.graphData(data);
-                if (addedLinks && addedLinks.length) {
-                    for (const e of addedLinks) startFadeInLink(e.source, e.target);
-                }
-                const found = data.nodes.find(x => x.id === n.id);
-                if (!focusLockId && found && typeof found.x === 'number' && typeof found.y === 'number') {
-                    graph.centerAt(found.x, found.y, 600);
-                }
-                startFadeIn(n.id);
-            });
-            socket.on('new_edge', e => {
-                if (!e || !e.from || !e.to) return;
-                addLinkSafe(e.from, e.to);
-                const addedLinks = resolvePendingLinks();
-                graph.graphData(data);
-                if (addedLinks && addedLinks.length) {
-                    for (const ed of addedLinks) startFadeInLink(ed.source, ed.target);
-                } else {
-                    startFadeInLink(e.from, e.to);
-                }
-            });
-            socket.on('update_node', n => {
-                const found = data.nodes.find(x => x.id === n.id);
-                focusLockId = n.id;
-                if (found && typeof found.x === 'number' && typeof found.y === 'number') {
-                    graph.centerAt(found.x, found.y, 500);
-                }
-            });
-            socket.on('batch_ready', payload => {
-                if (payload && payload.parentid && payload.parentid === focusLockId) {
-                    focusLockId = null;
-                }
+            fetch('/data').then(r => r.json()).then(renderOnce).catch(err => {
+                console.error('Failed to load data', err);
             });
             function resize() {
                 graph.width(container.clientWidth);

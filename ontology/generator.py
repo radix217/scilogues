@@ -12,9 +12,17 @@ try:
 except Exception:
     _load_dotenv = None
 
+def _find_env_path() -> Optional[Path]:
+    start = Path(__file__).resolve().parent
+    for parent in [start] + list(start.parents):
+        envp = parent / ".env"
+        if envp.exists():
+            return envp
+    return None
+
 def openai_client() -> OpenAI:
-    env_path = Path(__file__).resolve().parent / ".env"
-    if _load_dotenv is not None:
+    env_path = _find_env_path()
+    if _load_dotenv is not None and env_path is not None:
         _load_dotenv(dotenv_path=env_path, override=False)
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
@@ -41,9 +49,8 @@ def candidate_models() -> list[str]:
         return [single]
     return [
         "anthropic/claude-sonnet-4",
-        "google/gemini-2.5-pro",
         "openai/gpt-5",
-#        "x-ai/grok-4" #reasoning cannot be disabled.
+        "qwen/qwen3-max"
     ]
 
 def session() -> tuple[OpenAI, str]:
@@ -59,7 +66,7 @@ class RootTopic(BaseModel):
 
 class Subtopic(BaseModel):
     topic: str = Field(min_length=1)
-    importance: int = Field(ge=0, le=10, description="0-10 scale of importance/relevance")
+    importance: int = Field(ge=0, le=10)
 
 class Subtopics(BaseModel):
     subtopics: list[Subtopic] = Field(default_factory=list)
@@ -71,6 +78,7 @@ def chat_request(client: OpenAI, model: str, prompt: str, response_model: Type[B
         messages=msgs,
         reasoning_effort='minimal',
         response_model=response_model,
+        max_tokens=512
     )
 
 def expand(topic: str, hierarchy: list[str]) -> Optional[Iterable[Any]]:
@@ -79,13 +87,16 @@ def expand(topic: str, hierarchy: list[str]) -> Optional[Iterable[Any]]:
     prompt = build_expand_prompt(topic, path)
     resp = chat_request(client, model, prompt, response_model=Subtopics)
     if not resp.subtopics:
-        return None
+        return []
     result: list[tuple[str, str, int]] = []
     for s in resp.subtopics:
+        topic_name = str(getattr(s, "topic", "")).strip()
         try:
             imp_raw = int(getattr(s, "importance", 0) or 0)
         except Exception:
             imp_raw = 0
         imp = max(0, min(10, imp_raw))
-        result.append((uuid.uuid4().hex[:8], s.topic, imp))
+        if not topic_name:
+            continue
+        result.append((uuid.uuid4().hex[:8], topic_name, imp))
     return result

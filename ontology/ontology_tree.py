@@ -62,8 +62,15 @@ def read_nodes(csv_path: str) -> List[Node]:
     return nodes
 
 
+def ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+
 def write_nodes(csv_path: str, nodes: List[Node]) -> None:
     fieldnames = ["id", "topic", "parentid", "expanded", "depth", "importance"]
+    ensure_parent_dir(csv_path)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -101,6 +108,7 @@ def read_edges(csv_path: str) -> List[Edge]:
 
 def write_edges(csv_path: str, edges: List[Edge]) -> None:
     fieldnames = ["parentid", "childid", "relation", "order"]
+    ensure_parent_dir(csv_path)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -171,12 +179,12 @@ def normalize_node(obj: Any, parentid: Optional[str], parentdepth: int) -> Optio
             d = int(dval)
         except Exception:
             d = parentdepth + (0 if pid is None else 1)
-        imp = obj.get("importance", 0)
+        imp_raw = obj.get("importance", 0)
         try:
-            impi = int(imp)
+            imp = int(imp_raw)
         except Exception:
-            impi = 0
-        return Node(id=nid, topic=topic, parentid=pid, expanded=exp, depth=int(d), importance=impi)
+            imp = 0
+        return Node(id=nid, topic=topic, parentid=pid, expanded=exp, depth=int(d), importance=imp)
     if isinstance(obj, (tuple, list)) and len(obj) >= 2:
         nid = str(obj[0])
         topic = str(obj[1])
@@ -238,6 +246,8 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
 
     total_added = 0
     while total_added < max_nodes:
+        if len(nodes) >= max_nodes:
+            break
         current = first_unexpanded(nodes)
         if current is None:
             break
@@ -258,7 +268,8 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
 
         new_nodes: List[Node] = []
         new_edges: List[Edge] = []
-        if children:
+        if isinstance(children, list) and len(children) > 0:
+            reached_limit = False
             for child in children:
                 normalized = normalize_node(child, parentid=current.id, parentdepth=current.depth)
                 if not normalized:
@@ -272,6 +283,9 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
                         edge_set.add((current.id, existing.id))
                         new_edges.append(e)
                 else:
+                    if len(nodes) >= max_nodes:
+                        reached_limit = True
+                        break
                     n = Node(
                         id=normalized.id,
                         topic=normalized.topic,
@@ -291,6 +305,10 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
 
             current.expanded = "true"
             total_added += len(new_nodes)
+            if reached_limit:
+                write_nodes(nodes_csv, nodes)
+                write_edges(edges_csv, edges)
+                break
 
             # Emit new nodes and edges
             for n in new_nodes:
@@ -300,6 +318,9 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
                 socketio.emit('new_edge', {"from": e.parentid, "to": e.childid})
                 socketio.sleep(0.02)
             socketio.emit('batch_ready', {"parentid": current.id, "children": [n.id for n in new_nodes]})
+        elif isinstance(children, list) and len(children) == 0:
+            current.expanded = "skipped"
+            socketio.emit('batch_ready', {"parentid": current.id, "children": []})
         else:
             if normalize_expanded(current.expanded) == "skipped":
                 current.expanded = "skipped"
@@ -314,16 +335,27 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
     write_edges(edges_csv, edges)
 
 def update_csv_tree(csv_path: str, max_nodes: int = 1000) -> List[Node]:
-    nodes = read_nodes(csv_path)
+    nodes_csv = csv_path
+    edges_csv = os.path.splitext(csv_path)[0] + "_edges.csv"
+
+    nodes = read_nodes(nodes_csv)
+    edges = read_edges(edges_csv)
     if not nodes:
         nodes.append(Node(id="root", topic=ROOT_TOPIC, parentid=None, expanded="false", depth=0, importance=10))
-        write_nodes(csv_path, nodes)
+        write_nodes(nodes_csv, nodes)
+
     total_added = 0
     nodes_by_id = index_by_id(nodes)
+    topic_idx = index_by_topic_ci(nodes)
+    edge_set = {(e.parentid, e.childid) for e in edges}
+
     while total_added < max_nodes:
+        if len(nodes) >= max_nodes:
+            break
         current = first_unexpanded(nodes)
         if current is None:
             break
+
         if int(getattr(current, "importance", 0) or 0) < 6:
             current.expanded = "skipped"
             children = None
@@ -334,26 +366,71 @@ def update_csv_tree(csv_path: str, max_nodes: int = 1000) -> List[Node]:
             except Exception as e:
                 print(f"Failed to expand {current.topic}: {e}")
                 children = None
-        before = len(nodes)
-        if children:
-            added_count = add_children(nodes, current, children)
-            total_added += added_count
-            if added_count > 0:
-                nodes_by_id = index_by_id(nodes)
+
+        new_nodes: List[Node] = []
+        new_edges: List[Edge] = []
+        if isinstance(children, list) and len(children) > 0:
+            reached_limit = False
+            for child in children:
+                normalized = normalize_node(child, parentid=current.id, parentdepth=current.depth)
+                if not normalized:
+                    continue
+                key = normalized.topic.strip().lower()
+                existing = topic_idx.get(key)
+                if existing:
+                    if (current.id, existing.id) not in edge_set:
+                        e = Edge(parentid=current.id, childid=existing.id)
+                        edges.append(e)
+                        edge_set.add((current.id, existing.id))
+                        new_edges.append(e)
+                else:
+                    if len(nodes) >= max_nodes:
+                        reached_limit = True
+                        break
+                    n = Node(
+                        id=normalized.id,
+                        topic=normalized.topic,
+                        parentid=current.id,
+                        expanded="false",
+                        depth=current.depth + 1,
+                        importance=int(getattr(normalized, "importance", 0) or 0),
+                    )
+                    nodes.append(n)
+                    nodes_by_id[n.id] = n
+                    topic_idx[key] = n
+                    new_nodes.append(n)
+                    e = Edge(parentid=current.id, childid=n.id)
+                    edges.append(e)
+                    edge_set.add((current.id, n.id))
+                    new_edges.append(e)
+
+            current.expanded = "true"
+            total_added += len(new_nodes)
+            if reached_limit:
+                write_nodes(nodes_csv, nodes)
+                write_edges(edges_csv, edges)
+                break
+        elif isinstance(children, list) and len(children) == 0:
+            current.expanded = "skipped"
         else:
             if normalize_expanded(current.expanded) == "skipped":
                 current.expanded = "skipped"
             else:
                 current.expanded = "true"
-        if len(nodes) == before and normalize_expanded(current.expanded) != "false" and first_unexpanded(nodes) is None:
-            break
-        write_nodes(csv_path, nodes)
-    write_nodes(csv_path, nodes)
+
+        write_nodes(nodes_csv, nodes)
+        write_edges(edges_csv, edges)
+
+    ensure_parent_dir(nodes_csv)
+    write_nodes(nodes_csv, nodes)
+    ensure_parent_dir(edges_csv)
+    write_edges(edges_csv, edges)
     return nodes
 
 
-CSV_PATH = "tree.csv"
-MAX_NODES = 25000
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(BASE_DIR, "graph", "tree.csv")
+MAX_NODES = 30000
 
 
 def main() -> None:
