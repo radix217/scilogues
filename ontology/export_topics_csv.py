@@ -73,8 +73,11 @@ def export_topics_csv(pkl_path: str, csv_path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pkl", default=os.path.join(os.path.dirname(__file__), "graph", "tree.pkl"))
-    parser.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "topics.csv"))
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    default_pkl = os.path.join(root_dir, "data", "ontology", "tree.pkl")
+    default_out = os.path.join(root_dir, "data", "topics.csv")
+    parser.add_argument("--pkl", default=default_pkl)
+    parser.add_argument("--out", default=default_out)
     args = parser.parse_args()
     export_topics_csv(args.pkl, args.out)
     print(f"Wrote {args.out}")

@@ -438,7 +438,8 @@ def update_csv_tree(csv_path: str, max_nodes: int = 1000) -> List[Node]:
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(BASE_DIR, "graph", "tree.csv")
+ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
+CSV_PATH = os.path.join(ROOT_DIR, "data", "ontology", "tree.csv")
 MAX_NODES = 30000
 
 
