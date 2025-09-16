@@ -1,6 +1,12 @@
 from flask import Flask, render_template, jsonify
 import os
-from ontology_tree import read_nodes, read_edges
+import sys
+
+try:
+    from ontology.ontology_tree import read_nodes, read_edges
+except Exception:
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from ontology_tree import read_nodes, read_edges
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 

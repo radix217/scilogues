@@ -1,8 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Iterable, Dict, Any, Tuple
-import csv
 import os
+import pickle
+import networkx as nx
 from generator import expand
 from flask_socketio import SocketIO
 
@@ -42,24 +43,11 @@ def normalize_expanded(v: Any) -> str:
     return "false"
 
 
-def read_nodes(csv_path: str) -> List[Node]:
-    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
-        return []
-    nodes: List[Node] = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            nodes.append(
-                Node(
-                    id=str(row.get("id", "")).strip(),
-                    topic=str(row.get("topic", "")).strip(),
-                    parentid=(p if (p := str(row.get("parentid", "")).strip()) != "" else None),
-                    expanded=normalize_expanded(row.get("expanded", "false")),
-                    depth=int(str(row.get("depth", "0")).strip() or 0),
-                    importance=int(str(row.get("importance", "0")).strip() or 0),
-                )
-            )
-    return nodes
+def graph_path_from_csv(csv_path: str) -> str:
+    base, _ = os.path.splitext(csv_path)
+    if base.endswith("_edges"):
+        base = base[: -len("_edges")]
+    return base + ".pkl"
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -68,59 +56,89 @@ def ensure_parent_dir(path: str) -> None:
         os.makedirs(d, exist_ok=True)
 
 
-def write_nodes(csv_path: str, nodes: List[Node]) -> None:
-    fieldnames = ["id", "topic", "parentid", "expanded", "depth", "importance"]
-    ensure_parent_dir(csv_path)
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for n in nodes:
-            writer.writerow(
-                {
-                    "id": n.id,
-                    "topic": n.topic,
-                    "parentid": "" if n.parentid is None else n.parentid,
-                    "expanded": normalize_expanded(getattr(n, "expanded", "false")),
-                    "depth": int(getattr(n, "depth", 0) or 0),
-                    "importance": int(getattr(n, "importance", 0) or 0),
-                }
+def load_graph(csv_path: str) -> nx.DiGraph:
+    gpath = graph_path_from_csv(csv_path)
+    if os.path.exists(gpath) and os.path.getsize(gpath) > 0:
+        try:
+            with open(gpath, "rb") as f:
+                G = pickle.load(f)
+            if not isinstance(G, nx.DiGraph):
+                G = nx.DiGraph(G)
+            return G
+        except Exception:
+            pass
+    return nx.DiGraph()
+
+
+def persist_graph(G: nx.DiGraph, csv_path: str) -> None:
+    gpath = graph_path_from_csv(csv_path)
+    ensure_parent_dir(gpath)
+    with open(gpath, "wb") as f:
+        pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def nodes_from_graph(G: nx.DiGraph) -> List[Node]:
+    nodes: List[Node] = []
+    for nid, data in G.nodes(data=True):
+        nodes.append(
+            Node(
+                id=str(nid),
+                topic=str(data.get("topic", "")),
+                parentid=data.get("parentid"),
+                expanded=normalize_expanded(data.get("expanded", "false")),
+                depth=int(data.get("depth", 0) or 0),
+                importance=int(data.get("importance", 0) or 0),
             )
+        )
+    return nodes
 
 
-def read_edges(csv_path: str) -> List[Edge]:
-    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
-        return []
+def edges_from_graph(G: nx.DiGraph) -> List[Edge]:
     edges: List[Edge] = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            pid = str(row.get("parentid", "")).strip()
-            cid = str(row.get("childid", "")).strip()
-            rel = str(row.get("relation", "is_a")).strip() or "is_a"
-            try:
-                order = int(str(row.get("order", "0")).strip() or 0)
-            except Exception:
-                order = 0
-            if pid and cid:
-                edges.append(Edge(parentid=pid, childid=cid, relation=rel, order=order))
+    for u, v, data in G.edges(data=True):
+        edges.append(
+            Edge(
+                parentid=str(u),
+                childid=str(v),
+                relation=str(data.get("relation", "is_a") or "is_a"),
+                order=int(data.get("order", 0) or 0),
+            )
+        )
     return edges
 
 
+def read_nodes(csv_path: str) -> List[Node]:
+    G = load_graph(csv_path)
+    return nodes_from_graph(G)
+
+
+def read_edges(csv_path: str) -> List[Edge]:
+    G = load_graph(csv_path)
+    return edges_from_graph(G)
+
+
+def write_nodes(csv_path: str, nodes: List[Node]) -> None:
+    G = load_graph(csv_path)
+    for n in nodes:
+        if not G.has_node(n.id):
+            G.add_node(n.id)
+        G.nodes[n.id]["topic"] = n.topic
+        G.nodes[n.id]["parentid"] = n.parentid
+        G.nodes[n.id]["expanded"] = normalize_expanded(getattr(n, "expanded", "false"))
+        G.nodes[n.id]["depth"] = int(getattr(n, "depth", 0) or 0)
+        G.nodes[n.id]["importance"] = int(getattr(n, "importance", 0) or 0)
+    persist_graph(G, csv_path)
+
+
 def write_edges(csv_path: str, edges: List[Edge]) -> None:
-    fieldnames = ["parentid", "childid", "relation", "order"]
-    ensure_parent_dir(csv_path)
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for e in edges:
-            writer.writerow(
-                {
-                    "parentid": e.parentid,
-                    "childid": e.childid,
-                    "relation": e.relation,
-                    "order": int(getattr(e, "order", 0) or 0),
-                }
-            )
+    G = load_graph(csv_path)
+    for e in edges:
+        if not G.has_node(e.parentid):
+            G.add_node(e.parentid, topic=str(e.parentid), parentid=None, expanded="false", depth=0, importance=0)
+        if not G.has_node(e.childid):
+            G.add_node(e.childid, topic=str(e.childid), parentid=e.parentid, expanded="false", depth=0, importance=0)
+        G.add_edge(e.parentid, e.childid, relation=e.relation, order=int(getattr(e, "order", 0) or 0))
+    persist_graph(G, csv_path)
 
 
 def index_by_id(nodes: List[Node]) -> Dict[str, Node]:
@@ -152,6 +170,20 @@ def first_unexpanded(nodes: List[Node]) -> Optional[Node]:
         if normalize_expanded(n.expanded) == "false":
             return n
     return None
+
+
+def build_topic_index(G: nx.DiGraph) -> Dict[str, str]:
+    idx: Dict[str, str] = {}
+    for nid, data in G.nodes(data=True):
+        key = str(data.get("topic", "")).strip().lower()
+        if key and key not in idx:
+            idx[key] = str(nid)
+    return idx
+
+
+def ensure_root(G: nx.DiGraph) -> None:
+    if G.number_of_nodes() == 0:
+        G.add_node("root", topic=ROOT_TOPIC, parentid=None, expanded="false", depth=0, importance=10)
 
 
 def normalize_node(obj: Any, parentid: Optional[str], parentdepth: int) -> Optional[Node]:
@@ -222,44 +254,47 @@ def add_children(nodes: List[Node], parent: Node, children: Iterable[Any]) -> in
 
 
 def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000) -> None:
-    nodes_csv = csv_path
-    edges_csv = os.path.splitext(csv_path)[0] + "_edges.csv"
-
-    nodes = read_nodes(nodes_csv)
-    edges = read_edges(edges_csv)
-
-    nodes_by_id = index_by_id(nodes)
-    topic_idx = index_by_topic_ci(nodes)
-    edge_set = {(e.parentid, e.childid) for e in edges}
-
-    socketio.emit('existing_nodes', [n.__dict__ for n in nodes])
-    if edges:
-        socketio.emit('existing_edges', [e.__dict__ for e in edges])
-
-    if not nodes:
-        root_node = Node(id="root", topic=ROOT_TOPIC, parentid=None, expanded="false", depth=0, importance=10)
-        nodes.append(root_node)
-        nodes_by_id[root_node.id] = root_node
-        topic_idx[root_node.topic.strip().lower()] = root_node
-        write_nodes(nodes_csv, nodes)
-        socketio.emit('new_node', root_node.__dict__)
+    G = load_graph(csv_path)
+    ensure_root(G)
+    topic_idx = build_topic_index(G)
+    socketio.emit('existing_nodes', [n.__dict__ for n in nodes_from_graph(G)])
+    existing_edges = [
+        {"parentid": str(u), "childid": str(v), "relation": d.get("relation", "is_a"), "order": int(d.get("order", 0) or 0)}
+        for u, v, d in G.edges(data=True)
+    ]
+    if existing_edges:
+        socketio.emit('existing_edges', existing_edges)
 
     total_added = 0
     while total_added < max_nodes:
-        if len(nodes) >= max_nodes:
+        if G.number_of_nodes() >= max_nodes:
             break
-        current = first_unexpanded(nodes)
-        if current is None:
+        current_id = None
+        for nid, data in G.nodes(data=True):
+            if normalize_expanded(data.get("expanded", "false")) == "false":
+                current_id = str(nid)
+                break
+        if current_id is None:
             break
+
+        current = Node(
+            id=current_id,
+            topic=str(G.nodes[current_id].get("topic", "")),
+            parentid=G.nodes[current_id].get("parentid"),
+            expanded=normalize_expanded(G.nodes[current_id].get("expanded", "false")),
+            depth=int(G.nodes[current_id].get("depth", 0) or 0),
+            importance=int(G.nodes[current_id].get("importance", 0) or 0),
+        )
 
         socketio.emit('update_node', current.__dict__)
         socketio.sleep(0.1)
 
-        if int(getattr(current, "importance", 0) or 0) < 6:
-            current.expanded = "skipped"
+        if int(current.importance or 0) < 6:
+            G.nodes[current.id]["expanded"] = "skipped"
             children = None
         else:
             try:
+                nodes_by_id = {str(nid): Node(id=str(nid), topic=str(d.get("topic", "")), parentid=d.get("parentid"), expanded=normalize_expanded(d.get("expanded", "false")), depth=int(d.get("depth", 0) or 0), importance=int(d.get("importance", 0) or 0)) for nid, d in G.nodes(data=True)}
                 hierarchy = get_hierarchy(current, nodes_by_id)
                 children = expand(current.topic, hierarchy)
             except Exception as e:
@@ -275,42 +310,34 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
                 if not normalized:
                     continue
                 key = normalized.topic.strip().lower()
-                existing = topic_idx.get(key)
-                if existing:
-                    if (current.id, existing.id) not in edge_set:
-                        e = Edge(parentid=current.id, childid=existing.id)
-                        edges.append(e)
-                        edge_set.add((current.id, existing.id))
-                        new_edges.append(e)
+                existing_id = topic_idx.get(key)
+                if existing_id:
+                    if not G.has_edge(current.id, existing_id):
+                        G.add_edge(current.id, existing_id, relation="is_a", order=0)
+                        new_edges.append(Edge(parentid=current.id, childid=existing_id))
                 else:
-                    if len(nodes) >= max_nodes:
+                    if G.number_of_nodes() >= max_nodes:
                         reached_limit = True
                         break
-                    n = Node(
-                        id=normalized.id,
+                    G.add_node(
+                        normalized.id,
                         topic=normalized.topic,
                         parentid=current.id,
                         expanded="false",
                         depth=current.depth + 1,
                         importance=int(getattr(normalized, "importance", 0) or 0),
                     )
-                    nodes.append(n)
-                    nodes_by_id[n.id] = n
-                    topic_idx[key] = n
-                    new_nodes.append(n)
-                    e = Edge(parentid=current.id, childid=n.id)
-                    edges.append(e)
-                    edge_set.add((current.id, n.id))
-                    new_edges.append(e)
+                    topic_idx[key] = normalized.id
+                    new_nodes.append(Node(id=normalized.id, topic=normalized.topic, parentid=current.id, expanded="false", depth=current.depth + 1, importance=int(getattr(normalized, "importance", 0) or 0)))
+                    G.add_edge(current.id, normalized.id, relation="is_a", order=0)
+                    new_edges.append(Edge(parentid=current.id, childid=normalized.id))
 
-            current.expanded = "true"
+            G.nodes[current.id]["expanded"] = "true"
             total_added += len(new_nodes)
+            persist_graph(G, csv_path)
             if reached_limit:
-                write_nodes(nodes_csv, nodes)
-                write_edges(edges_csv, edges)
                 break
 
-            # Emit new nodes and edges
             for n in new_nodes:
                 socketio.emit('new_node', n.__dict__)
                 socketio.sleep(0.05)
@@ -319,113 +346,95 @@ def generate_tree_live(socketio: SocketIO, csv_path: str, max_nodes: int = 1000)
                 socketio.sleep(0.02)
             socketio.emit('batch_ready', {"parentid": current.id, "children": [n.id for n in new_nodes]})
         elif isinstance(children, list) and len(children) == 0:
-            current.expanded = "skipped"
+            G.nodes[current.id]["expanded"] = "skipped"
+            persist_graph(G, csv_path)
             socketio.emit('batch_ready', {"parentid": current.id, "children": []})
         else:
-            if normalize_expanded(current.expanded) == "skipped":
-                current.expanded = "skipped"
+            if normalize_expanded(G.nodes[current.id].get("expanded", "false")) == "skipped":
+                G.nodes[current.id]["expanded"] = "skipped"
             else:
-                current.expanded = "true"
+                G.nodes[current.id]["expanded"] = "true"
+            persist_graph(G, csv_path)
             socketio.emit('batch_ready', {"parentid": current.id, "children": []})
-
-        write_nodes(nodes_csv, nodes)
-        write_edges(edges_csv, edges)
-
-    write_nodes(nodes_csv, nodes)
-    write_edges(edges_csv, edges)
 
 def update_csv_tree(csv_path: str, max_nodes: int = 1000) -> List[Node]:
-    nodes_csv = csv_path
-    edges_csv = os.path.splitext(csv_path)[0] + "_edges.csv"
-
-    nodes = read_nodes(nodes_csv)
-    edges = read_edges(edges_csv)
-    if not nodes:
-        nodes.append(Node(id="root", topic=ROOT_TOPIC, parentid=None, expanded="false", depth=0, importance=10))
-        write_nodes(nodes_csv, nodes)
+    G = load_graph(csv_path)
+    ensure_root(G)
+    topic_idx = build_topic_index(G)
 
     total_added = 0
-    nodes_by_id = index_by_id(nodes)
-    topic_idx = index_by_topic_ci(nodes)
-    edge_set = {(e.parentid, e.childid) for e in edges}
-
     while total_added < max_nodes:
-        if len(nodes) >= max_nodes:
+        if G.number_of_nodes() >= max_nodes:
             break
-        current = first_unexpanded(nodes)
-        if current is None:
+        current_id = None
+        for nid, data in G.nodes(data=True):
+            if normalize_expanded(data.get("expanded", "false")) == "false":
+                current_id = str(nid)
+                break
+        if current_id is None:
             break
 
-        if int(getattr(current, "importance", 0) or 0) < 6:
-            current.expanded = "skipped"
+        current_topic = str(G.nodes[current_id].get("topic", ""))
+        current_depth = int(G.nodes[current_id].get("depth", 0) or 0)
+        current_importance = int(G.nodes[current_id].get("importance", 0) or 0)
+
+        if int(current_importance or 0) < 6:
+            G.nodes[current_id]["expanded"] = "skipped"
+            persist_graph(G, csv_path)
+            continue
+        try:
+            nodes_by_id = {str(nid): Node(id=str(nid), topic=str(d.get("topic", "")), parentid=d.get("parentid"), expanded=normalize_expanded(d.get("expanded", "false")), depth=int(d.get("depth", 0) or 0), importance=int(d.get("importance", 0) or 0)) for nid, d in G.nodes(data=True)}
+            current_node = nodes_by_id[current_id]
+            hierarchy = get_hierarchy(current_node, nodes_by_id)
+            children = expand(current_topic, hierarchy)
+        except Exception as e:
+            print(f"Failed to expand {current_topic}: {e}")
             children = None
-        else:
-            try:
-                hierarchy = get_hierarchy(current, nodes_by_id)
-                children = expand(current.topic, hierarchy)
-            except Exception as e:
-                print(f"Failed to expand {current.topic}: {e}")
-                children = None
 
-        new_nodes: List[Node] = []
-        new_edges: List[Edge] = []
+        new_nodes_count = 0
         if isinstance(children, list) and len(children) > 0:
             reached_limit = False
             for child in children:
-                normalized = normalize_node(child, parentid=current.id, parentdepth=current.depth)
+                normalized = normalize_node(child, parentid=current_id, parentdepth=current_depth)
                 if not normalized:
                     continue
                 key = normalized.topic.strip().lower()
-                existing = topic_idx.get(key)
-                if existing:
-                    if (current.id, existing.id) not in edge_set:
-                        e = Edge(parentid=current.id, childid=existing.id)
-                        edges.append(e)
-                        edge_set.add((current.id, existing.id))
-                        new_edges.append(e)
+                existing_id = topic_idx.get(key)
+                if existing_id:
+                    if not G.has_edge(current_id, existing_id):
+                        G.add_edge(current_id, existing_id, relation="is_a", order=0)
                 else:
-                    if len(nodes) >= max_nodes:
+                    if G.number_of_nodes() >= max_nodes:
                         reached_limit = True
                         break
-                    n = Node(
-                        id=normalized.id,
+                    G.add_node(
+                        normalized.id,
                         topic=normalized.topic,
-                        parentid=current.id,
+                        parentid=current_id,
                         expanded="false",
-                        depth=current.depth + 1,
+                        depth=current_depth + 1,
                         importance=int(getattr(normalized, "importance", 0) or 0),
                     )
-                    nodes.append(n)
-                    nodes_by_id[n.id] = n
-                    topic_idx[key] = n
-                    new_nodes.append(n)
-                    e = Edge(parentid=current.id, childid=n.id)
-                    edges.append(e)
-                    edge_set.add((current.id, n.id))
-                    new_edges.append(e)
+                    topic_idx[key] = normalized.id
+                    G.add_edge(current_id, normalized.id, relation="is_a", order=0)
+                    new_nodes_count += 1
 
-            current.expanded = "true"
-            total_added += len(new_nodes)
+            G.nodes[current_id]["expanded"] = "true"
+            total_added += new_nodes_count
+            persist_graph(G, csv_path)
             if reached_limit:
-                write_nodes(nodes_csv, nodes)
-                write_edges(edges_csv, edges)
                 break
         elif isinstance(children, list) and len(children) == 0:
-            current.expanded = "skipped"
+            G.nodes[current_id]["expanded"] = "skipped"
+            persist_graph(G, csv_path)
         else:
-            if normalize_expanded(current.expanded) == "skipped":
-                current.expanded = "skipped"
+            if normalize_expanded(G.nodes[current_id].get("expanded", "false")) == "skipped":
+                G.nodes[current_id]["expanded"] = "skipped"
             else:
-                current.expanded = "true"
+                G.nodes[current_id]["expanded"] = "true"
+            persist_graph(G, csv_path)
 
-        write_nodes(nodes_csv, nodes)
-        write_edges(edges_csv, edges)
-
-    ensure_parent_dir(nodes_csv)
-    write_nodes(nodes_csv, nodes)
-    ensure_parent_dir(edges_csv)
-    write_edges(edges_csv, edges)
-    return nodes
+    return nodes_from_graph(G)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -434,8 +443,6 @@ MAX_NODES = 30000
 
 
 def main() -> None:
-    # This function is now intended for offline generation.
-    # For the live web server, run app.py
     nodes = update_csv_tree(CSV_PATH, max_nodes=MAX_NODES)
     print(f"Wrote {len(nodes)} nodes to {CSV_PATH}")
 

@@ -4,3 +4,4 @@ instructor
 Flask
 Flask-SocketIO
 python-dotenv
+networkx
