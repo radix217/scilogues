@@ -3,6 +3,8 @@ import json
 import os
 import secrets
 import tempfile
+import sys
+import asyncio
 from dataset.dialogue_engine import generate_dialogue
 
 
@@ -76,6 +78,8 @@ def build_dataset(
     order_path: str = "data/topics.order.json",
     output_path: str = "data/dataset.jsonl",
     state_path: str = "data/dataset.state.json",
+    workers: int = 8,
+    batch_size: int | None = None,
 ) -> None:
     ensure_order(csv_path, order_path)
     ids = load_order_ids(order_path)
@@ -85,22 +89,86 @@ def build_dataset(
     total = len(ids)
     if cursor >= total:
         return
-    with open(output_path, "a", encoding="utf-8") as out_file:
-        for i in range(cursor, total):
-            rid = ids[i]
-            rec = topic_lookup.get(rid)
-            if not rec:
-                save_cursor(state_path, i + 1)
-                continue
-            topic_value = rec["topic"]
-            path_value = rec.get("path", "")
-            data_id = secrets.token_hex(4)
-            gen = generate_dialogue(topic_value, path_value)
-            text_value = gen if isinstance(gen, str) and gen is not None else ""
-            obj = {"id": data_id, "topic": topic_value, "text": text_value}
-            out_file.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            out_file.flush()
-            save_cursor(state_path, i + 1)
+    if batch_size is None:
+        batch_size = max(1, workers * 2)
+
+    async def process() -> None:
+        nonlocal cursor
+        try:
+            with open(output_path, "a", encoding="utf-8") as out_file:
+                i = cursor
+                while i < total:
+                    end = min(i + batch_size, total)
+                    meta: list[tuple[int, str, dict[str, str] | None]] = []
+                    tasks: list[asyncio.Task] = []
+                    sem = asyncio.Semaphore(workers)
+
+                    async def run_one(topic_value: str, path_value: str):
+                        async with sem:
+                            return await generate_dialogue(topic_value, path_value)
+
+                    for j in range(i, end):
+                        rid = ids[j]
+                        rec = topic_lookup.get(rid)
+                        if not rec:
+                            meta.append((j, rid, None))
+                            continue
+                        meta.append((j, rid, rec))
+                        topic_value = rec["topic"]
+                        path_value = rec.get("path", "")
+                        tasks.append(asyncio.create_task(run_one(topic_value, path_value)))
+
+                    results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+
+                    k = 0
+                    for pos, rid, rec in meta:
+                        if not rec:
+                            continue
+                        topic_value = rec["topic"]
+                        try:
+                            res = results[k]
+                            k += 1
+                        except IndexError:
+                            print(
+                                f"[generation_error] id={rid} topic={topic_value} type=IndexError message=results_alignment",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
+                        if isinstance(res, Exception):
+                            print(
+                                f"[generation_error] id={rid} topic={topic_value} type={type(res).__name__} message={res}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
+                        if not isinstance(res, str) or res is None:
+                            print(
+                                f"[invalid_output] id={rid} topic={topic_value} reason=non_string_or_none",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
+                        words = [w for w in res.strip().split() if w]
+                        if len(words) < 50:
+                            print(
+                                f"[invalid_output] id={rid} topic={topic_value} reason=too_short word_count={len(words)}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
+                        data_id = secrets.token_hex(4)
+                        obj = {"id": data_id, "topic": topic_value, "text": res}
+                        out_file.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                        out_file.flush()
+
+                    save_cursor(state_path, end)
+                    i = end
+        except KeyboardInterrupt:
+            save_cursor(state_path, i if 'i' in locals() else cursor)
+            raise
+
+    asyncio.run(process())
 
 
 if __name__ == "__main__":

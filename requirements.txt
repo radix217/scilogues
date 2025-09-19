@@ -5,3 +5,5 @@ Flask
 Flask-SocketIO
 python-dotenv
 networkx
+Faker
+tavily-python
